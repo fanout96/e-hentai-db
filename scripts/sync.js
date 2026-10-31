@@ -13,6 +13,11 @@ if (proxy) {
   agent = new HttpsProxyAgent(proxy);
 }
 
+// the list only shows minutes, and a gallery can show up in it long after it was
+// posted, so a walk cannot stop at the newest gallery in the db: it has to keep going
+// below it, or every gallery past that point is lost for good
+const SAFETY_HOURS = Number(process.env.SYNC_SAFETY_HOURS ?? 6);
+
 class Sync {
 	constructor() {
 		this.query = this.query.bind(this);
@@ -193,6 +198,9 @@ class Sync {
 				console.log(`offset last posted = ${lastPosted}`);
 			}
 
+			const stopBefore = Math.floor((lastPosted - SAFETY_HOURS * 3600) / 60) * 60;
+			console.log(`walking down to ${new Date(stopBefore * 1000).toISOString()}`);
+
 			const list = [];
 
 			const getPages = async (expunged) => {
@@ -206,7 +214,7 @@ class Sync {
 					const curList = await this.retryResolver(() => this.getPages(next, expunged), this.retryTimes);
 					console.log(`got ${curList[0][0]} to ${curList.slice(-1)[0][0]}`);
 					curList.forEach(e => {
-						if (new Date(`${e[2].split(' ').join('T')}Z`).getTime() > lastPosted * 1000) {
+						if (new Date(`${e[2].split(' ').join('T')}Z`).getTime() / 1000 >= stopBefore) {
 							list.push(e);
 						}
 						else {
