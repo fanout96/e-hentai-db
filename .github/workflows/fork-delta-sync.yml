@@ -33,7 +33,7 @@ concurrency:
 
 permissions:
   contents: write
-  actions: read
+  actions: write
 
 jobs:
   delta:
@@ -342,6 +342,7 @@ jobs:
           gh release upload "$ROLLING_TAG" manifest.json --clobber
 
       - name: Cache prev dump for next run
+        id: cache
         if: steps.check.outputs.changed == 'true'
         uses: actions/upload-artifact@v4
         with:
@@ -354,6 +355,27 @@ jobs:
           retention-days: 1
           overwrite: true
           include-hidden-files: true
+
+      - name: Delete older prev-full artifacts
+        if: steps.check.outputs.changed == 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          KEEP_ID: ${{ steps.cache.outputs.artifact-id }}
+        run: |
+          set -euo pipefail
+          if [ -z "${KEEP_ID:-}" ]; then
+            echo "current artifact id is empty; skip cleanup"
+            exit 0
+          fi
+          gh api --paginate "repos/${{ github.repository }}/actions/artifacts?per_page=100" \
+            --jq '.artifacts[] | select(.name == "prev-full") | .id' |
+          while read -r id; do
+            [ -n "$id" ] || continue
+            [ "$id" = "$KEEP_ID" ] && continue
+            echo "deleting old prev-full artifact: $id"
+            gh api -X DELETE "repos/${{ github.repository }}/actions/artifacts/$id" || true
+          done
 
       - name: Retention cleanup (keep last N generations)
         if: steps.check.outputs.changed == 'true'
