@@ -1,0 +1,412 @@
+name: Fork Delta Sync (categories + SQLite deltas)
+
+# Проверка upstream каждые 30 минут. Запуск привязан к появлению нового
+# upstream-релиза: state = asset id релиза, а не номер workflow-рана.
+# Upstream перезаписывает nightly-ассет, поэтому пропущенные промежуточные
+# релизы восстановить нельзя — обрабатывается актуальный asset один раз.
+# Благодаря asset id новый релиз не будет пропущен: даже если форк спал
+# несколько циклов, первый запуск увидит изменившийся asset и обработает
+# актуальное состояние. Состояние двигается только после публикации.
+on:
+  # repository_dispatch — надёжный внешний триггер (cron-job.org, сервер,
+  # systemd timer и т.п.): POST /repos/{owner}/{repo}/dispatches
+  # {"event_type":"fork-delta-sync"}. GitHub schedule ниже — best-effort:
+  # запуск может задержаться на десятки минут или быть пропущен под нагрузкой.
+  repository_dispatch:
+    types: [fork-delta-sync]
+  schedule:
+    # Не :00/:30 — в эти минуты очередь GitHub Actions наиболее загружена.
+    - cron: '7,37 * * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Перегенерировать патч даже без изменений дампа
+        required: false
+        default: false
+        type: boolean
+
+# cancel-in-progress:true — зависший в queued ран НЕ блокирует новые запуски.
+# Отменённый ран не двигает state, поэтому следующий запуск обработает актуальный релиз.
+concurrency:
+  group: fork-delta-sync
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  delta:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    env:
+      UPSTREAM: URenko/e-hentai-db
+      UPSTREAM_WORKFLOW: .github/workflows/exh-sync.yml
+      NIGHTLY_TAG: nightly
+      NIGHTLY_ASSET: e-hentai.db.zstd
+      ROLLING_TAG: rolling
+      SYNC_TAG: sync-state
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup tools
+        run: sudo apt-get update && sudo apt-get install -y zstd jq sqlite3
+
+      - name: Detect new upstream release
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # 1. Состояние форка. manifest.json публикуется последним, поэтому его
+          #    seq — надёжная точка "данные уже опубликованы".
+          LAST_RUN=0
+          LAST_MANIFEST_ASSET=""
+          LAST_ASSET=""
+          if curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+              "https://api.github.com/repos/${{ github.repository }}/releases/tags/$ROLLING_TAG" \
+              -o own_release.json 2>/dev/null; then
+            MAN_URL=$(jq -r '.assets[]|select(.name=="manifest.json")|.url // empty' own_release.json)
+            if [ -n "$MAN_URL" ]; then
+              curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+                -H "Accept: application/octet-stream" "$MAN_URL" -o prev_manifest.json
+              LAST_RUN=$(jq -r '.seq // 0' prev_manifest.json 2>/dev/null || echo 0)
+              LAST_MANIFEST_ASSET=$(jq -r '.upstream_asset_id // empty' prev_manifest.json 2>/dev/null || true)
+            fi
+          fi
+
+          # 2. Asset id последнего обработанного upstream-релиза + fallback seq
+          #    для старого формата состояния (last_run.txt без last_asset.txt).
+          if curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+              "https://api.github.com/repos/${{ github.repository }}/releases/tags/$SYNC_TAG" \
+              -o sync_release.json 2>/dev/null; then
+            URL=$(jq -r '.assets[]|select(.name=="last_asset.txt")|.url // empty' sync_release.json)
+            if [ -z "$LAST_MANIFEST_ASSET" ] && [ -n "$URL" ]; then
+              LAST_ASSET=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+                -H "Accept: application/octet-stream" "$URL" | tr -d '[:space:]')
+            fi
+            if [ "$LAST_RUN" = "0" ]; then
+              URL=$(jq -r '.assets[]|select(.name=="last_run.txt")|.url // empty' sync_release.json)
+              if [ -n "$URL" ]; then
+                LAST_RUN=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+                  -H "Accept: application/octet-stream" "$URL" | tr -d '[:space:]')
+              fi
+            fi
+          fi
+          [ -n "$LAST_MANIFEST_ASSET" ] && LAST_ASSET="$LAST_MANIFEST_ASSET"
+          case "$LAST_RUN" in ''|*[!0-9]*) LAST_RUN=0;; esac
+
+          # 3. Релиз оригинальной БД. Наличие и id ассета — источник истины:
+          #    upstream заменяет ассет атомарно, новый id = новый релиз.
+          curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/$UPSTREAM/releases/tags/$NIGHTLY_TAG" \
+            -o nightly_release.json
+          ASSET_ID=$(jq -r --arg n "$NIGHTLY_ASSET" \
+            '.assets[]|select(.name==$n)|.id // empty' nightly_release.json)
+          ASSET_UPDATED=$(jq -r --arg n "$NIGHTLY_ASSET" \
+            '.assets[]|select(.name==$n)|.updated_at // empty' nightly_release.json)
+          if [ -z "$ASSET_ID" ]; then
+            echo "::warning::upstream nightly asset is not published yet — waiting"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # 4. Последний успешный run именно sync-workflow upstream. Он нужен
+          #    только как seq/ссылка на логи, содержимое берём из asset id.
+          WF_ID=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/$UPSTREAM/actions/workflows?per_page=100" \
+            | jq -r --arg p "$UPSTREAM_WORKFLOW" '.workflows[]|select(.path==$p)|.id' | head -n1)
+          if [ -z "$WF_ID" ]; then
+            echo "upstream workflow not found: $UPSTREAM_WORKFLOW"
+            exit 1
+          fi
+          curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/$UPSTREAM/actions/workflows/$WF_ID/runs?status=completed&conclusion=success&per_page=1" \
+            -o uprun.json
+          TOP_NUM=$(jq -r '.workflow_runs[0].run_number // empty' uprun.json)
+          TOP_ID=$(jq -r '.workflow_runs[0].id // empty' uprun.json)
+          TOP_UPDATED=$(jq -r '.workflow_runs[0].updated_at // empty' uprun.json)
+          if [ -z "$TOP_NUM" ]; then
+            echo "no successful upstream runs found"
+            exit 1
+          fi
+
+          # Релиз новее последнего успешного рана => публикуется следующее
+          # поколение. Ждём его завершения, чтобы не обработать недописанный дамп.
+          if [[ "$ASSET_UPDATED" > "$TOP_UPDATED" ]]; then
+            echo "nightly asset ($ASSET_UPDATED) is newer than latest successful run ($TOP_UPDATED) — waiting"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          REGENERATE=false
+          if [ "${{ inputs.force }}" = "true" ]; then
+            REGENERATE=true
+          fi
+
+          # Нового ассета нет — новых релизов нет. Если в старом manifest нет
+          # upstream_asset_id, но seq уже совпадает с верхним run, тоже не
+          # пересобираем: иначе state-лаг мог бы перезаписать валидную дельту.
+          if [ "$REGENERATE" != "true" ]; then
+            if [ -n "$LAST_MANIFEST_ASSET" ] && [ "$LAST_MANIFEST_ASSET" = "$ASSET_ID" ]; then
+              echo "upstream release unchanged (manifest asset id=$ASSET_ID)"
+              echo "changed=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            elif [ -z "$LAST_MANIFEST_ASSET" ] && [ "$LAST_RUN" -gt 0 ] && [ "$LAST_RUN" -ge "$TOP_NUM" ]; then
+              echo "upstream run already published (seq=$LAST_RUN >= top=$TOP_NUM)"
+              echo "changed=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            elif [ -n "$LAST_ASSET" ] && [ "$LAST_ASSET" = "$ASSET_ID" ] && [ "$LAST_RUN" -ge "$TOP_NUM" ]; then
+              echo "upstream release unchanged (state asset id=$ASSET_ID)"
+              echo "changed=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          echo "last_synced=$LAST_RUN last_asset=$LAST_ASSET"
+          echo "new_asset=$ASSET_ID top_upstream=$TOP_NUM"
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "last_run=$LAST_RUN" >> "$GITHUB_OUTPUT"
+          echo "run_number=$TOP_NUM" >> "$GITHUB_OUTPUT"
+          echo "run_id=$TOP_ID" >> "$GITHUB_OUTPUT"
+          echo "asset_id=$ASSET_ID" >> "$GITHUB_OUTPUT"
+          echo "regenerate=$REGENERATE" >> "$GITHUB_OUTPUT"
+
+      - name: Skip if unchanged
+        if: steps.check.outputs.changed == 'false'
+        run: echo "Upstream release unchanged — nothing to do."
+
+      - name: Download NEW nightly dump
+        if: steps.check.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ASSET_ID: ${{ steps.check.outputs.asset_id }}
+        run: |
+          set -euo pipefail
+          # Скачивание через API (работает с GITHUB_TOKEN; прямой /releases/assets отдаёт 404).
+          # Берём именно тот asset id, который был зафиксирован на шаге проверки.
+          ASSET_API=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$UPSTREAM/releases/assets/$ASSET_ID" | jq -r .url)
+          [ -n "$ASSET_API" ] && [ "$ASSET_API" != null ] || { echo "no nightly asset"; exit 1; }
+          curl -fL --retry 3 -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/octet-stream" "$ASSET_API" -o new.db.zstd
+          zstd -dc new.db.zstd > cur.db
+          sqlite3 cur.db "PRAGMA integrity_check;" | grep -q '^ok$'
+          test "$(stat -c%s cur.db)" -gt 1000000
+
+      - name: Prepare previous snapshot
+        if: steps.check.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LAST_RUN: ${{ steps.check.outputs.last_run }}
+        run: |
+          set -euo pipefail
+          rm -f prev.db prev.db.zstd
+          if [ "${LAST_RUN:-0}" = "0" ]; then
+            rm -f prev_manifest.json
+            echo "First run — no previous snapshot, full snapshots only."
+            exit 0
+          fi
+
+          # Кэш артефактов быстрее, но использовать его можно только если он
+          # соответствует опубликованному seq (иначе база применения патча
+          # окажется новее состояния клиентов).
+          if gh run download -n prev-full -D ./cached 2>/dev/null; then
+            CACHE_SEQ=0
+            if [ -f cached/prev_manifest.json ]; then
+              CACHE_SEQ=$(jq -r '.seq // 0' cached/prev_manifest.json 2>/dev/null || echo 0)
+            fi
+            if [ "$CACHE_SEQ" = "$LAST_RUN" ]; then
+              if [ -f cached/cur.db.zstd ] && zstd -t -q cached/cur.db.zstd; then
+                zstd -dc cached/cur.db.zstd > prev.db
+                [ -f cached/prev_manifest.json ] && cp cached/prev_manifest.json prev_manifest.json
+                echo "prev source: artifact cache (zstd), seq=$CACHE_SEQ"
+                exit 0
+              elif [ -f cached/cur.db ] && sqlite3 cached/cur.db "PRAGMA integrity_check;" | grep -q '^ok$'; then
+                cp cached/cur.db prev.db
+                [ -f cached/prev_manifest.json ] && cp cached/prev_manifest.json prev_manifest.json
+                echo "prev source: artifact cache (raw db), seq=$CACHE_SEQ"
+                exit 0
+              fi
+              echo "::warning::cached prev dump is corrupt — discarding"
+            else
+              echo "::warning::cache seq=$CACHE_SEQ != published seq=$LAST_RUN — discarding"
+            fi
+            rm -rf cached prev.db
+          fi
+
+          # Fallback: снапшот misc из своего rolling-релиза (manifest уже скачан
+          # на шаге проверки, но подстрахуемся, если его там не было).
+          if [ ! -f prev_manifest.json ]; then
+            if curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+                "https://api.github.com/repos/${{ github.repository }}/releases/tags/$ROLLING_TAG" \
+                -o own_release.json 2>/dev/null; then
+              MAN_URL=$(jq -r '.assets[]|select(.name=="manifest.json")|.url // empty' own_release.json)
+              if [ -n "$MAN_URL" ]; then
+                curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+                  -H "Accept: application/octet-stream" "$MAN_URL" -o prev_manifest.json
+              fi
+            fi
+          fi
+
+          if [ -f prev_manifest.json ]; then
+            PREV_SEQ=$(jq -r '.seq // 0' prev_manifest.json)
+            SNAP_FILE=$(jq -r --arg s "$PREV_SEQ" \
+              '.categories.misc.snapshot // empty' prev_manifest.json)
+            [ -z "$SNAP_FILE" ] && SNAP_FILE="ehdb-misc-run$PREV_SEQ.db.zstd"
+            SNAP_URL=$(jq -r --arg f "$SNAP_FILE" \
+              '.assets[]|select(.name==$f)|.url // empty' own_release.json)
+            if [ -n "$SNAP_URL" ]; then
+              if curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+                  -H "Accept: application/octet-stream" "$SNAP_URL" -o prev.db.zstd \
+                 && zstd -t -q prev.db.zstd; then
+                zstd -dc prev.db.zstd > prev.db
+                echo "prev source: rolling release snapshot ($SNAP_FILE), seq=$PREV_SEQ"
+                exit 0
+              fi
+              echo "::warning::rolling snapshot download is corrupt — first-run mode"
+            fi
+          fi
+
+          rm -f prev.db prev.db.zstd
+          echo "::warning::no previous snapshot available — full snapshots only"
+
+      - name: Extract latest upstream changelog
+        if: steps.check.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_ID: ${{ steps.check.outputs.run_id }}
+        run: |
+          set -uo pipefail
+          rm -rf logs logs.zip changelog.txt
+          if [ -n "$RUN_ID" ] && [ "$RUN_ID" != null ]; then
+            curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+              "https://api.github.com/repos/$UPSTREAM/actions/runs/$RUN_ID/logs" -o logs.zip
+            python3 -c "import zipfile; zipfile.ZipFile('logs.zip').extractall('logs')" || true
+            grep -rhE "got [0-9]+ new galleries of|root gid of" logs 2>/dev/null \
+              | sed 's/^[^Z]*Z //' | sort -u > changelog.txt || true
+            echo "changelog lines: $(wc -l < changelog.txt)"
+          fi
+
+      - name: Generate deltas / snapshots / manifest
+        if: steps.check.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_NUMBER: ${{ steps.check.outputs.run_number }}
+          ASSET_ID: ${{ steps.check.outputs.asset_id }}
+        run: |
+          set -euo pipefail
+          cd forktools
+          SEQ="${RUN_NUMBER:?upstream run_number is required}"
+          ARGS="--new ../cur.db --out dist --config config/categories.json --seq $SEQ --asset-id $ASSET_ID"
+          if [ -f ../prev.db ]; then
+            ARGS="--old ../prev.db $ARGS"
+            [ -f ../prev_manifest.json ] && ARGS="$ARGS --prev-manifest ../prev_manifest.json"
+          else
+            echo "No previous snapshot found — first run, generating full snapshots only."
+          fi
+          [ -f ../changelog.txt ] && ARGS="$ARGS --changelog ../changelog.txt"
+          python3 delta.py $ARGS
+
+          # сжатие НЕ блокирует: cur.db остаётся нетронутым (fallback для кэша),
+          # cur.db.zstd пишется отдельно; если не хватило места — жмём level 1
+          if ! zstd -T2 -3 -q --force ../cur.db -o ../cur.db.zstd; then
+            echo "::warning::zstd -3 failed, trying level 1"
+            rm -f ../cur.db.zstd
+            zstd -T2 -1 -q --force ../cur.db -o ../cur.db.zstd || true
+          fi
+          cp dist/manifest.json ../prev_manifest.json
+          echo "seq=$SEQ" >> "$GITHUB_ENV"
+
+      - name: Publish rolling release (assets first, manifest last)
+        if: steps.check.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_NUMBER: ${{ steps.check.outputs.run_number }}
+        run: |
+          set -euo pipefail
+          gh release create "$ROLLING_TAG" --title "ehdb — run $RUN_NUMBER" --notes "ehdb — run $RUN_NUMBER" 2>/dev/null || true
+          gh release edit "$ROLLING_TAG" --title "ehdb — run $RUN_NUMBER" --notes "ehdb — run $RUN_NUMBER"
+          cd forktools/dist
+          # в релиз — SQLite-дельты и снапшоты категорий; manifest.json — последним
+          # (атомарная точка фиксации). Полный дамп в релиз НЕ загружаем.
+          FILES=$(ls | grep -v '^manifest.json$' | grep -v '^ehdb-full-' || true)
+          if [ -n "$FILES" ]; then
+            gh release upload "$ROLLING_TAG" $FILES --clobber
+          fi
+          gh release upload "$ROLLING_TAG" manifest.json --clobber
+
+      - name: Cache prev dump for next run
+        if: steps.check.outputs.changed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: prev-full
+          path: |
+            cur.db.zstd
+            cur.db
+            prev_manifest.json
+          if-no-files-found: ignore
+          compression-level: 0
+          retention-days: 2
+          overwrite: true
+          include-hidden-files: true
+
+      - name: Retention cleanup (keep last N generations)
+        if: steps.check.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          PATCH_KEEP=$(jq -r '.retention.patch_generations // 30' forktools/config/categories.json)
+          SNAP_KEEP=$(jq -r '.retention.full_snapshots // 7' forktools/config/categories.json)
+          gh release view "$ROLLING_TAG" --json assets -q '.assets[].name' > /tmp/assets.txt || true
+
+          # SQLite-дельты и снапшоты: отдельные лимиты для каждого типа.
+          jq -R -s 'split("\n") | map(select(length > 0))' /tmp/assets.txt \
+            | jq -r --argjson pk "$PATCH_KEEP" --argjson sk "$SNAP_KEEP" '
+                [.[] | capture("^ehdb-(?<cat>.+)-run(?<seq>\\d+)\\.(?<ext>delta\\.db\\.zstd|db\\.zstd)$")]
+                | group_by(.cat + .ext)
+                | .[]
+                | (if .[0].ext == "delta.db.zstd" then $pk else $sk end) as $keep
+                | sort_by(-(.seq | tonumber)) | .[$keep:][]
+                | "ehdb-\(.cat)-run\(.seq).\(.ext)"
+              ' > /tmp/stale.txt
+          while read -r old_asset; do
+            [ -n "$old_asset" ] || continue
+            echo "deleting stale asset: $old_asset"
+            gh release delete-asset "$ROLLING_TAG" "$old_asset" --yes || true
+          done < /tmp/stale.txt
+
+
+          # legacy-ассеты со временем в имени: ehdb-<cat>-YYYYMMDDHHMM.*
+          jq -R -s 'split("\n") | map(select(length > 0))' /tmp/assets.txt \
+            | jq -r '
+                .[] | capture("^ehdb-(?<cat>.+)-(?<ts>[0-9]{12})\\.(?<ext>.+)$")
+                | "ehdb-\(.cat)-\(.ts).\(.ext)"
+              ' > /tmp/legacy_stale.txt
+          while read -r old_asset; do
+            [ -n "$old_asset" ] || continue
+            echo "deleting legacy timestamped asset: $old_asset"
+            gh release delete-asset "$ROLLING_TAG" "$old_asset" --yes || true
+          done < /tmp/legacy_stale.txt
+          echo "retention cleanup done (patches=$PATCH_KEEP, snapshots=$SNAP_KEEP)"
+
+      - name: Publish state marker
+        if: steps.check.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_NUMBER: ${{ steps.check.outputs.run_number }}
+          ASSET_ID: ${{ steps.check.outputs.asset_id }}
+        run: |
+          set -euo pipefail
+          # Пишем состояние ТОЛЬКО после публикации rolling-манифеста. Если job
+          # упадёт раньше, следующий запуск обработает актуальный релиз повторно.
+          echo "$RUN_NUMBER" > last_run.txt
+          echo "$ASSET_ID" > last_asset.txt
+          gh release create "$SYNC_TAG" --title "Sync state" --notes "" 2>/dev/null || true
+          gh release upload "$SYNC_TAG" last_run.txt last_asset.txt --clobber

@@ -1,0 +1,16 @@
+{
+  "_comment": "Настройки форка. enabled_categories — какие категории обрабатывать ('*' = все). include_private_categories — включать ли 'private'. retention — сколько поколений SQLite-дельт/снапшотов хранить.",
+  "enabled_categories": [
+    "misc"
+  ],
+  "all_categories": false,
+  "include_private_categories": false,
+  "compression_level": 12,
+  "retention": {
+    "patch_generations": 30,
+    "full_snapshots": 7
+  },
+  "upstream_repo": "URenko/e-hentai-db",
+  "nightly_tag": "nightly",
+  "nightly_asset": "e-hentai.db.zstd"
+}
