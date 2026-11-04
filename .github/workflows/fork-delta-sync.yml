@@ -1,22 +1,17 @@
 name: Fork Delta Sync (categories + SQLite deltas)
 
-# Проверка upstream каждые 30 минут. Запуск привязан к появлению нового
-# upstream-релиза: state = asset id релиза, а не номер workflow-рана.
+# Запуск выполняется только по repository_dispatch. State привязан к появлению
+# нового upstream-релиза: state = asset id релиза, а не номер workflow-рана.
 # Upstream перезаписывает nightly-ассет, поэтому пропущенные промежуточные
 # релизы восстановить нельзя — обрабатывается актуальный asset один раз.
 # Благодаря asset id новый релиз не будет пропущен: даже если форк спал
 # несколько циклов, первый запуск увидит изменившийся asset и обработает
 # актуальное состояние. Состояние двигается только после публикации.
 on:
-  # repository_dispatch — надёжный внешний триггер (cron-job.org, сервер,
-  # systemd timer и т.п.): POST /repos/{owner}/{repo}/dispatches
-  # {"event_type":"fork-delta-sync"}. GitHub schedule ниже — best-effort:
-  # запуск может задержаться на десятки минут или быть пропущен под нагрузкой.
+  # repository_dispatch — внешний триггер: POST /repos/{owner}/{repo}/dispatches
+  # {"event_type":"fork-delta-sync"}.
   repository_dispatch:
     types: [fork-delta-sync]
-  schedule:
-    # Не :00/:30 — в эти минуты очередь GitHub Actions наиболее загружена.
-    - cron: '7,37 * * * *'
   workflow_dispatch:
     inputs:
       force:

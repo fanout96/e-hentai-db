@@ -1,9 +1,6 @@
 name: ExHentai Sync
 
 on:
-  schedule:
-    - cron: '5 */2 * * *'
-    - cron: '35 */12 * * *'
   workflow_dispatch:
     inputs:
       run_resync:
@@ -96,9 +93,7 @@ jobs:
           npm run torrent-import exhentai.org
 
       - name: Resync last 48 hours (every 12 hours)
-        if: >-
-          (github.event_name == 'schedule' && github.event.schedule == '35 */12 * * *')
-          || (github.event_name == 'workflow_dispatch' && inputs.run_resync)
+        if: github.event_name == 'workflow_dispatch' && inputs.run_resync
         run: |
           set -euo pipefail
           npm run resync 48
